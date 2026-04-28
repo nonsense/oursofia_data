@@ -116,6 +116,13 @@ jobs:
           print('Validated manifest + gzip payload:', len(payload), 'signals')
           PY
 
+      - name: Copy static site files
+        run: |
+          set -euo pipefail
+          for f in privacy.html; do
+            if [ -f "$f" ]; then cp "$f" "${PUBLIC_OUTPUT_DIR}/"; fi
+          done
+
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
