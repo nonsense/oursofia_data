@@ -44,8 +44,7 @@ jobs:
         with:
           repository: nonsense/oursofia
           path: oursofia
-          # If nonsense/oursofia ever becomes private, add:
-          # token: ${{ secrets.OURSOFIA_REPO_READ_TOKEN }}
+          token: ${{ secrets.OURSOFIA_REPO_READ_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
