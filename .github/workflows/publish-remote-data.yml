@@ -1,0 +1,144 @@
+name: Publish remote data
+
+on:
+  schedule:
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: publish-remote-data
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      APP_REPO: nonsense/oursofia
+      STATE_BRANCH: remote-data-state
+      BASE_PUBLIC_URL: https://nonsense.github.io/oursofia_data
+      APP_REPO_DIR: ${{ github.workspace }}/oursofia
+      STATE_REPO_DIR: ${{ github.workspace }}/state-repo
+      PUBLIC_OUTPUT_DIR: ${{ github.workspace }}/build/remote-data-public
+      STATE_OUTPUT_DIR: ${{ github.workspace }}/build/remote-data-state
+      PREVIOUS_CANONICAL_STATE_PATH: ${{ github.workspace }}/state-repo/canonical_signals.json
+      PREVIOUS_STATE_MANIFEST_PATH: ${{ github.workspace }}/state-repo/state_manifest.json
+      NEXT_CANONICAL_STATE_PATH: ${{ github.workspace }}/build/remote-data-state/canonical_signals.json
+      NEXT_STATE_MANIFEST_PATH: ${{ github.workspace }}/build/remote-data-state/state_manifest.json
+      PYTHONUNBUFFERED: '1'
+      GITHUB_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout app repo
+        uses: actions/checkout@v4
+        with:
+          repository: nonsense/oursofia
+          path: oursofia
+          # If nonsense/oursofia ever becomes private, add:
+          # token: ${{ secrets.OURSOFIA_REPO_READ_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install requests
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Restore persisted state branch
+        run: |
+          set -euo pipefail
+
+          if git ls-remote --exit-code origin "refs/heads/${STATE_BRANCH}" >/dev/null 2>&1; then
+            git clone --depth 1 --branch "${STATE_BRANCH}" \
+              "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+              "${STATE_REPO_DIR}"
+          else
+            git clone --depth 1 \
+              "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+              "${STATE_REPO_DIR}"
+            (
+              cd "${STATE_REPO_DIR}"
+              git switch --orphan "${STATE_BRANCH}"
+              git rm -rf . >/dev/null 2>&1 || true
+              find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+            )
+          fi
+
+          mkdir -p "${PUBLIC_OUTPUT_DIR}" "${STATE_OUTPUT_DIR}"
+
+      - name: Run remote-data publish pipeline
+        run: |
+          set -euo pipefail
+          bash "${APP_REPO_DIR}/scripts/publish-remote-data.sh"
+        env:
+          PYTHON_BIN: python3
+          PUBLIC_BASE_URL: ${{ env.BASE_PUBLIC_URL }}
+          PUBLIC_OUTPUT_DIR: ${{ env.PUBLIC_OUTPUT_DIR }}
+          PREVIOUS_CANONICAL_STATE_PATH: ${{ env.PREVIOUS_CANONICAL_STATE_PATH }}
+          PREVIOUS_STATE_MANIFEST_PATH: ${{ env.PREVIOUS_STATE_MANIFEST_PATH }}
+          NEXT_CANONICAL_STATE_PATH: ${{ env.NEXT_CANONICAL_STATE_PATH }}
+          NEXT_STATE_MANIFEST_PATH: ${{ env.NEXT_STATE_MANIFEST_PATH }}
+          STATE_OUTPUT_DIR: ${{ env.STATE_OUTPUT_DIR }}
+
+      - name: Validate generated public artifacts
+        run: |
+          set -euo pipefail
+          test -f "${PUBLIC_OUTPUT_DIR}/manifest.json"
+          test -f "${PUBLIC_OUTPUT_DIR}/signals_latest.json.gz"
+          python - <<'PY'
+          import gzip, json, pathlib
+          public_dir = pathlib.Path('${{ env.PUBLIC_OUTPUT_DIR }}')
+          manifest = json.loads((public_dir / 'manifest.json').read_text(encoding='utf-8'))
+          assert manifest['signals']['compression'] == 'gzip'
+          with gzip.open(public_dir / 'signals_latest.json.gz', 'rt', encoding='utf-8') as handle:
+              payload = json.load(handle)
+          assert isinstance(payload, list)
+          print('Validated manifest + gzip payload:', len(payload), 'signals')
+          PY
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ env.PUBLIC_OUTPUT_DIR }}
+
+      - name: Deploy GitHub Pages
+        uses: actions/deploy-pages@v4
+
+      - name: Persist canonical state to state branch
+        run: |
+          set -euo pipefail
+
+          cp "${NEXT_CANONICAL_STATE_PATH}" "${STATE_REPO_DIR}/canonical_signals.json"
+          if [ -f "${STATE_OUTPUT_DIR}/state_manifest.json" ]; then
+            cp "${STATE_OUTPUT_DIR}/state_manifest.json" "${STATE_REPO_DIR}/state_manifest.json"
+          fi
+
+          (
+            cd "${STATE_REPO_DIR}"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add canonical_signals.json state_manifest.json 2>/dev/null || git add canonical_signals.json
+            if git diff --cached --quiet; then
+              echo "No state changes to commit"
+              exit 0
+            fi
+            git commit -m "Update canonical signal state"
+            git push origin "${STATE_BRANCH}"
+          )
