@@ -30,6 +30,9 @@ jobs:
       STATE_REPO_DIR: ${{ github.workspace }}/state-repo
       PUBLIC_OUTPUT_DIR: ${{ github.workspace }}/build/remote-data-public
       STATE_OUTPUT_DIR: ${{ github.workspace }}/build/remote-data-state
+      RAW_SNAPSHOT_OUTPUT_DIR: ${{ github.workspace }}/build/remote-data-state/snapshots
+      RAW_DIFF_OUTPUT_DIR: ${{ github.workspace }}/build/remote-data-state/diffs
+      MONTHLY_RAW_SNAPSHOT_OUTPUT_DIR: ${{ github.workspace }}/build/remote-data-state/snapshots/monthly
       PREVIOUS_CANONICAL_STATE_PATH: ${{ github.workspace }}/state-repo/canonical_signals.json
       PREVIOUS_STATE_MANIFEST_PATH: ${{ github.workspace }}/state-repo/state_manifest.json
       NEXT_CANONICAL_STATE_PATH: ${{ github.workspace }}/build/remote-data-state/canonical_signals.json
@@ -99,21 +102,38 @@ jobs:
           NEXT_CANONICAL_STATE_PATH: ${{ env.NEXT_CANONICAL_STATE_PATH }}
           NEXT_STATE_MANIFEST_PATH: ${{ env.NEXT_STATE_MANIFEST_PATH }}
           STATE_OUTPUT_DIR: ${{ env.STATE_OUTPUT_DIR }}
+          RAW_SNAPSHOT_OUTPUT_DIR: ${{ env.RAW_SNAPSHOT_OUTPUT_DIR }}
+          RAW_DIFF_OUTPUT_DIR: ${{ env.RAW_DIFF_OUTPUT_DIR }}
+          MONTHLY_RAW_SNAPSHOT_OUTPUT_DIR: ${{ env.MONTHLY_RAW_SNAPSHOT_OUTPUT_DIR }}
 
       - name: Validate generated public artifacts
         run: |
           set -euo pipefail
           test -f "${PUBLIC_OUTPUT_DIR}/manifest.json"
           test -f "${PUBLIC_OUTPUT_DIR}/signals_latest.json.gz"
+          test -f "${RAW_SNAPSHOT_OUTPUT_DIR}/latest.json"
+          find "${RAW_DIFF_OUTPUT_DIR}" -maxdepth 1 -name 'diff_*.json' -type f | grep -q .
           python - <<'PY'
           import gzip, json, pathlib
           public_dir = pathlib.Path('${{ env.PUBLIC_OUTPUT_DIR }}')
+          state_dir = pathlib.Path('${{ env.STATE_OUTPUT_DIR }}')
           manifest = json.loads((public_dir / 'manifest.json').read_text(encoding='utf-8'))
+          state_manifest = json.loads((state_dir / 'state_manifest.json').read_text(encoding='utf-8'))
           assert manifest['signals']['compression'] == 'gzip'
+          assert state_manifest['rawSnapshot']['path'] == 'snapshots/latest.json'
+          assert state_manifest['rawSnapshot']['sourceFile'].startswith('signals_')
+          assert state_manifest['rawSnapshotDiff']['path'].startswith('diffs/diff_')
+          monthly = state_manifest['monthlyRawSnapshot']
+          assert monthly['month']
+          if monthly['path'] is not None:
+              assert monthly['path'].startswith('snapshots/monthly/signals_')
+              assert (state_dir / monthly['path']).is_file()
           with gzip.open(public_dir / 'signals_latest.json.gz', 'rt', encoding='utf-8') as handle:
               payload = json.load(handle)
           assert isinstance(payload, list)
-          print('Validated manifest + gzip payload:', len(payload), 'signals')
+          latest_raw = json.loads((state_dir / 'snapshots' / 'latest.json').read_text(encoding='utf-8'))
+          assert isinstance(latest_raw, list)
+          print('Validated manifest, gzip, raw snapshot, and JSON diff:', len(payload), 'signals')
           PY
 
       - name: Copy static site files
@@ -131,7 +151,7 @@ jobs:
       - name: Deploy GitHub Pages
         uses: actions/deploy-pages@v4
 
-      - name: Persist canonical state to state branch
+      - name: Persist canonical state, raw snapshot, and diff to state branch
         run: |
           set -euo pipefail
 
@@ -139,16 +159,24 @@ jobs:
           if [ -f "${STATE_OUTPUT_DIR}/state_manifest.json" ]; then
             cp "${STATE_OUTPUT_DIR}/state_manifest.json" "${STATE_REPO_DIR}/state_manifest.json"
           fi
+          if [ -d "${STATE_OUTPUT_DIR}/snapshots" ]; then
+            mkdir -p "${STATE_REPO_DIR}/snapshots"
+            cp -R "${STATE_OUTPUT_DIR}/snapshots/." "${STATE_REPO_DIR}/snapshots/"
+          fi
+          if [ -d "${STATE_OUTPUT_DIR}/diffs" ]; then
+            mkdir -p "${STATE_REPO_DIR}/diffs"
+            cp -R "${STATE_OUTPUT_DIR}/diffs/." "${STATE_REPO_DIR}/diffs/"
+          fi
 
           (
             cd "${STATE_REPO_DIR}"
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add canonical_signals.json state_manifest.json 2>/dev/null || git add canonical_signals.json
+            git add canonical_signals.json state_manifest.json snapshots diffs
             if git diff --cached --quiet; then
               echo "No state changes to commit"
               exit 0
             fi
-            git commit -m "Update canonical signal state"
+            git commit -m "Update canonical signal state and raw snapshot"
             git push origin "${STATE_BRANCH}"
           )
